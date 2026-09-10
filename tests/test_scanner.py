@@ -10,7 +10,7 @@ from src import mexc_futures_scraper as scanner
 CONTRACT = dict(symbol="ABC_USDT", quoteCoin="USDT", settleCoin="USDT", futureType=1,
                 state=0, contractSize="0.1")
 TICKER = dict(symbol="ABC_USDT", lastPrice="2", amount24="1000000", holdVol="500000",
-              riseFallRate="0.8", fundingRate="0.0001")
+              riseFallRate="0.6", fundingRate="0.0001")
 
 
 def test_thresholds_and_contract_units():
@@ -18,11 +18,11 @@ def test_thresholds_and_contract_units():
     assert evaluated == {"ABC_USDT"}
     assert coins[0]["oi"] == Decimal("100000")
     assert coins[0]["ratio"] == Decimal("0.10")
-    assert coins[0]["gain"] == 80
+    assert coins[0]["gain"] == 60
     assert coins[0]["funding"] == Decimal("0.01")
 
 
-@pytest.mark.parametrize("changes", [dict(riseFallRate="0.7999"), dict(amount24="999999"),
+@pytest.mark.parametrize("changes", [dict(riseFallRate="0.5999"), dict(amount24="999999"),
                                     dict(holdVol="499999"), dict(amount24="0")])
 def test_below_thresholds(changes):
     assert scanner.select_gainers([TICKER | changes], [CONTRACT]) == ([], {"ABC_USDT"})
