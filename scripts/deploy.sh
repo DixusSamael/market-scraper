@@ -20,6 +20,8 @@ old_stopped=false
 new_attempted=false
 completed=false
 
+# Invoked indirectly by the EXIT trap; rollback paths are covered by tests.
+# shellcheck disable=SC2317
 cleanup() {
     result=$?
     trap - EXIT HUP INT TERM
@@ -39,7 +41,7 @@ cleanup() {
     rm -f "$archive"
     exit "$result"
 }
-trap cleanup EXIT
+trap 'cleanup' EXIT
 trap 'exit 1' HUP INT TERM
 
 # Build exactly the tested commit before stopping the running bot. The archive
