@@ -10,4 +10,4 @@ for VAR in "${ENV_VARS[@]}"; do
 done
 
 # run the scraper
-python src/mexc_futures_scraper.py
+exec python src/mexc_futures_scraper.py

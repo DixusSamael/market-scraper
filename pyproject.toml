@@ -1,10 +1,10 @@
 [project]
 name = "market-scraper"
 version = "0.1.0"
+requires-python = ">=3.12"
 description = "A market data scraper"
 dependencies = [
     "requests",
-    "beautifulsoup4",
     "python-telegram-bot[job-queue]==20.7"
 ]
 
@@ -20,3 +20,6 @@ dev-dependencies = [
 
 [tool.ruff]
 line-length = 120
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
