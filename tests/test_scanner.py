@@ -10,7 +10,12 @@ from src import mexc_futures_scraper as scanner
 CONTRACT = dict(symbol="ABC_USDT", quoteCoin="USDT", settleCoin="USDT", futureType=1,
                 state=0, contractSize="0.1")
 TICKER = dict(symbol="ABC_USDT", lastPrice="2", amount24="1000000", holdVol="500000",
-              riseFallRate="0.6", fundingRate="0.0001")
+              riseFallRate="0.6", fundingRate="0.0001", timestamp=1789113090723)
+
+
+@pytest.fixture(autouse=True)
+def reference_price(monkeypatch):
+    monkeypatch.setattr(scanner, "fetch_reference_price", lambda *args: Decimal("1.25"))
 
 
 def test_thresholds_and_contract_units():
@@ -22,7 +27,7 @@ def test_thresholds_and_contract_units():
     assert coins[0]["funding"] == Decimal("0.01")
 
 
-@pytest.mark.parametrize("changes", [dict(riseFallRate="0.5999"), dict(amount24="999999"),
+@pytest.mark.parametrize("changes", [dict(lastPrice="1.999875", holdVol="600000"), dict(amount24="999999"),
                                     dict(holdVol="499999"), dict(amount24="0")])
 def test_below_thresholds(changes):
     assert scanner.select_gainers([TICKER | changes], [CONTRACT]) == ([], {"ABC_USDT"})
@@ -40,7 +45,7 @@ def test_invalid_data_does_not_rearm(value):
 
 
 def test_sort_and_optional_upper_ratio(monkeypatch):
-    high = TICKER | dict(symbol="XYZ_USDT", riseFallRate="1.2", holdVol="10000000")
+    high = TICKER | dict(symbol="XYZ_USDT", lastPrice="2.75", holdVol="10000000")
     contracts = [CONTRACT, CONTRACT | dict(symbol="XYZ_USDT")]
     assert [c["symbol"] for c in scanner.select_gainers([TICKER, high], contracts)[0]] == [
         "XYZ_USDT", "ABC_USDT"]
@@ -48,7 +53,8 @@ def test_sort_and_optional_upper_ratio(monkeypatch):
     assert len(scanner.select_gainers([TICKER, high], contracts)[0]) == 1
 
 
-def test_persistent_delivery_retry_and_reentry(tmp_path, monkeypatch):
+def test_daily_delivery_retry_restart_and_reentry(tmp_path, monkeypatch):
+    monkeypatch.setattr(scanner, "now", lambda: "2026-09-11T10:00:00+00:00")
     monkeypatch.setattr(scanner, "DB_PATH", str(tmp_path / "scanner.db"))
     scanner.init_db()
     with scanner.get_db() as conn:
@@ -56,18 +62,50 @@ def test_persistent_delivery_retry_and_reentry(tmp_path, monkeypatch):
                          [("1", "one", "today"), ("2", "two", "today")])
     app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock(side_effect=[None, RuntimeError()])))
     coins, evaluated = scanner.select_gainers([TICKER], [CONTRACT])
-    asyncio.run(scanner.deliver_alerts(app, coins, evaluated))
+    asyncio.run(scanner.deliver_alerts(app, coins))
     scanner.init_db()  # Restart must preserve successful deliveries and subscribers.
     app.bot.send_message = AsyncMock()
-    asyncio.run(scanner.deliver_alerts(app, coins, evaluated))
+    asyncio.run(scanner.deliver_alerts(app, coins))
     assert app.bot.send_message.call_count == 1
     assert app.bot.send_message.call_args.kwargs["chat_id"] == "2"
-    asyncio.run(scanner.deliver_alerts(app, [], set()))  # Missing data must not rearm.
-    asyncio.run(scanner.deliver_alerts(app, coins, evaluated))
+    asyncio.run(scanner.deliver_alerts(app, []))  # Missing data must not rearm.
+    asyncio.run(scanner.deliver_alerts(app, coins))
     assert app.bot.send_message.call_count == 1
-    asyncio.run(scanner.deliver_alerts(app, [], evaluated))
-    asyncio.run(scanner.deliver_alerts(app, coins, evaluated))
+    asyncio.run(scanner.deliver_alerts(app, []))
+    asyncio.run(scanner.deliver_alerts(app, coins))
+    assert app.bot.send_message.call_count == 1  # Re-entry on the same day stays suppressed.
+    monkeypatch.setattr(scanner, "now", lambda: "2026-09-11T23:59:59+00:00")
+    asyncio.run(scanner.deliver_alerts(app, coins))
+    assert app.bot.send_message.call_count == 1
+    monkeypatch.setattr(scanner, "now", lambda: "2026-09-12T00:00:00+00:00")
+    asyncio.run(scanner.deliver_alerts(app, coins))
+    assert app.bot.send_message.call_count == 3  # Both subscribers can receive the new day's alert.
+    scanner.init_db()
+    asyncio.run(scanner.deliver_alerts(app, coins))
     assert app.bot.send_message.call_count == 3
+    with scanner.get_db() as conn:
+        rows = conn.execute("SELECT sent_at FROM gainer_alerts").fetchall()
+    assert rows == [("2026-09-12T00:00:00+00:00",)] * 2
+
+
+def test_daily_cache_is_per_subscriber_and_ticker(tmp_path, monkeypatch):
+    monkeypatch.setattr(scanner, "DB_PATH", str(tmp_path / "scanner.db"))
+    monkeypatch.setattr(scanner, "now", lambda: "2026-09-11T12:00:00+00:00")
+    scanner.init_db()
+    with scanner.get_db() as conn:
+        conn.executemany("INSERT INTO telegram_users VALUES (?, ?, ?)",
+                         [("1", "existing", scanner.now()), ("2", "new", scanner.now())])
+        # Existing records from before the daily-cache change still suppress today's sends.
+        conn.execute("INSERT INTO gainer_alerts VALUES (?, ?, ?)",
+                     ("1", "ABC_USDT", "2026-09-11T09:00:00+00:00"))
+    coin = scanner.select_gainers([TICKER], [CONTRACT])[0][0]
+    app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+    asyncio.run(scanner.deliver_alerts(app, [coin, coin, coin | {"symbol": "XYZ_USDT"}]))
+    calls = app.bot.send_message.call_args_list
+    assert len(calls) == 3
+    assert calls[0].kwargs["chat_id"] == "2"
+    assert "ABC_USDT" in calls[0].kwargs["text"]
+    assert all("XYZ_USDT" in call.kwargs["text"] for call in calls[1:])
 
 
 @pytest.mark.parametrize("payload", [{"success": False, "code": 1},

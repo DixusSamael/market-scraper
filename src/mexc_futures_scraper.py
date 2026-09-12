@@ -8,6 +8,7 @@ from html import escape
 import logging
 import os
 from pathlib import Path
+import time
 from urllib.parse import quote
 
 import requests
@@ -60,19 +61,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     await update.effective_message.reply_text(
         "✅ You are subscribed to MEXC USDT perpetual futures gainer alerts!\n"
-        f"24h gain ≥ {MIN_GAIN_PERCENT}%, turnover ≥ ${MIN_TURNOVER_USDT:,.0f}, "
+        f"Rolling 24h gain (1-minute candles) ≥ {MIN_GAIN_PERCENT}%, turnover ≥ ${MIN_TURNOVER_USDT:,.0f}, "
         f"OI/turnover ≥ {MIN_OI_TURNOVER_RATIO:.0%}."
         + (f" Maximum OI/turnover: {MAX_OI_TURNOVER_RATIO:.0%}." if MAX_OI_TURNOVER_RATIO is not None else "")
+        + "\nEach ticker is sent at most once per UTC day."
     )
 
 
-def fetch_market_data(endpoint):
-    response = requests.get(f"{API_BASE}/{endpoint}", timeout=20)
+def fetch_payload(endpoint, params=None):
+    response = requests.get(f"{API_BASE}/{endpoint}", params=params, timeout=20)
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict) or payload.get("success") is not True or payload.get("code") != 0:
         raise ValueError(f"MEXC {endpoint} request was unsuccessful")
-    rows = payload.get("data")
+    return payload.get("data")
+
+
+def fetch_market_data(endpoint):
+    rows = fetch_payload(endpoint)
     if not isinstance(rows, list) or not rows or not all(isinstance(row, dict) for row in rows):
         raise ValueError(f"MEXC {endpoint} returned an invalid or empty market snapshot")
     return rows
@@ -85,8 +91,34 @@ def number(value):
     return result
 
 
+def fetch_reference_price(symbol, timestamp):
+    """Approximate price 24h before the ticker with that minute's opening price."""
+    timestamp = number(timestamp)
+    if timestamp < 86_400_000:
+        raise ValueError("Invalid ticker timestamp in milliseconds")
+    target = int(timestamp / 1000) - 86_400
+    minute = target // 60 * 60
+    # Sequential requests stay below the documented 20 requests / 2 seconds.
+    time.sleep(0.12)
+    data = fetch_payload(f"kline/{quote(symbol, safe='')}",
+                         {"interval": "Min1", "start": minute, "end": minute + 60})
+    if not isinstance(data, dict):
+        raise ValueError("Invalid candle response")
+    times, opens = data.get("time"), data.get("open")
+    if (not isinstance(times, list) or not isinstance(opens, list)
+            or len(times) != len(opens)):
+        raise ValueError("Invalid candle arrays")
+    matches = [price for stamp, price in zip(times, opens) if number(stamp) == minute]
+    if len(matches) != 1:
+        raise ValueError("Missing or duplicate 24h reference candle")
+    price = number(matches[0])
+    if price <= 0:
+        raise ValueError("Invalid reference price")
+    return price
+
+
 def select_gainers(tickers, contracts):
-    """Return sorted gainers and successfully evaluated symbols for alert rearming."""
+    """Return sorted gainers and successfully evaluated symbols for scan statistics."""
     details = {row.get("symbol"): row for row in contracts}
     gainers, evaluated = [], set()
     for ticker in tickers:
@@ -103,13 +135,18 @@ def select_gainers(tickers, contracts):
             turnover = number(ticker["amount24"])
             holdings = number(ticker["holdVol"])
             size = number(contract["contractSize"])
-            gain = number(ticker["riseFallRate"]) * 100
             funding = number(ticker["fundingRate"]) * 100
             if price <= 0 or size <= 0 or turnover < 0 or holdings < 0:
                 raise ValueError("Invalid market values")
             oi = holdings * size * price
             ratio = oi / turnover if turnover else Decimal(0)
-        except (KeyError, ValueError, TypeError, InvalidOperation):
+            if (turnover < MIN_TURNOVER_USDT or ratio < MIN_OI_TURNOVER_RATIO
+                    or (MAX_OI_TURNOVER_RATIO is not None and ratio > MAX_OI_TURNOVER_RATIO)):
+                evaluated.add(symbol)
+                continue
+            reference = fetch_reference_price(symbol, ticker["timestamp"])
+            gain = (price / reference - 1) * 100
+        except (KeyError, ValueError, TypeError, InvalidOperation, requests.RequestException):
             logger.warning("Skipping invalid market data for %s", symbol)
             continue
         evaluated.add(symbol)
@@ -132,7 +169,7 @@ def format_alert(coin):
     url = f"https://www.mexc.com/futures/{quote(coin['symbol'], safe='')}"
     return (
         f"🚀 <b>MEXC FUTURES GAINER</b>\n\n🔥 <b>{symbol}</b>\n"
-        f"24h Gain: {coin['gain']:+.2f}%\n"
+        f"Rolling 24h Gain (1m): {coin['gain']:+.2f}%\n"
         f"24h Turnover: ${coin['turnover']:,.0f}\n"
         f"Open Interest: ${coin['oi']:,.0f}\n"
         f"OI / Turnover: {coin['ratio']:.1%}\n"
@@ -142,16 +179,15 @@ def format_alert(coin):
     )
 
 
-async def deliver_alerts(app, gainers, evaluated):
-    qualifying = {coin["symbol"] for coin in gainers}
+async def deliver_alerts(app, gainers):
+    """Keep the latest successful delivery per subscriber/ticker as a daily cache."""
     with closing(get_db()) as conn, conn:
-        conn.executemany("DELETE FROM gainer_alerts WHERE symbol = ?",
-                         [(symbol,) for symbol in evaluated - qualifying])
         users = conn.execute("SELECT chat_id FROM telegram_users").fetchall()
-        sent = set(conn.execute("SELECT chat_id, symbol FROM gainer_alerts"))
+        sent = {(chat_id, symbol): sent_at[:10] for chat_id, symbol, sent_at in
+                conn.execute("SELECT chat_id, symbol, sent_at FROM gainer_alerts")}
     for coin in gainers:
         for (chat_id,) in users:
-            if (chat_id, coin["symbol"]) in sent:
+            if sent.get((chat_id, coin["symbol"])) == now()[:10]:
                 continue
             try:
                 await app.bot.send_message(chat_id=chat_id, text=format_alert(coin),
@@ -159,16 +195,18 @@ async def deliver_alerts(app, gainers, evaluated):
             except Exception:
                 logger.warning("Failed to notify chat %s; will retry next scan", chat_id)
                 continue
+            sent_at = now()
             with closing(get_db()) as conn, conn:
-                conn.execute("INSERT OR IGNORE INTO gainer_alerts VALUES (?, ?, ?)",
-                             (chat_id, coin["symbol"], now()))
-            sent.add((chat_id, coin["symbol"]))
+                conn.execute("""INSERT INTO gainer_alerts VALUES (?, ?, ?)
+                             ON CONFLICT(chat_id, symbol) DO UPDATE SET sent_at = excluded.sent_at""",
+                             (chat_id, coin["symbol"], sent_at))
+            sent[(chat_id, coin["symbol"])] = sent_at[:10]
 
 
 async def scrape_loop(context: ContextTypes.DEFAULT_TYPE):
     try:
         gainers, evaluated = await asyncio.to_thread(scrape)
-        await deliver_alerts(context.application, gainers, evaluated)
+        await deliver_alerts(context.application, gainers)
         HEALTH_PATH.touch()
         logger.info("Evaluated %d contracts; %d qualify", len(evaluated), len(gainers))
     except Exception:

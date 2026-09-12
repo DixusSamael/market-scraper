@@ -3,13 +3,25 @@
 Scans public MEXC market data every 60 seconds and sends Telegram alerts for active
 USDT perpetual futures matching all of these defaults:
 
-- 24h gain ≥ 60%.
+- Rolling 24h gain ≥ 60% (one-minute candle approximation).
 - 24h turnover ≥ 1,000,000 USDT.
 - Open-interest notional / 24h turnover ≥ 10%.
 
 Open-interest notional is `holdVol × contractSize × lastPrice`, in USDT.
 Alerts are ordered by gain and include turnover, OI, OI/turnover, funding rate,
 last price, and a futures link. No MEXC API key is needed.
+
+Gain is `(lastPrice / referencePrice - 1) × 100`. The reference is the opening
+price of the `Min1` candle containing the ticker timestamp minus 24 hours; its
+minute boundary is up to 59.999 seconds earlier than the target. This avoids
+depending on the ticker's timezone-based `riseFallRate` and is not an exact
+trade-by-trade 24-hour return. See the [MEXC K-line API documentation](https://mexcdevelop.github.io/apidocs/contract_v1_en/#k-line-data).
+Contracts must pass turnover and OI filters before a historical request is made.
+Historical requests are paced below 10 per second; scans can take longer than
+the configured interval and do not overlap. Missing history (including newly
+listed contracts), malformed candles, or request failures skip the symbol without
+resetting its alert state. Existing successful alerts remain recorded after this
+change and suppress further alerts for the same UTC day.
 
 ## Run
 
@@ -28,16 +40,18 @@ is replaced by market scanning; old announcement records are left intact.
 | --- | --- | --- |
 | `TG_BOT_TOKEN` | required | Telegram bot token |
 | `SCRAPE_INTERVAL` | `60` | Seconds between scans |
-| `MIN_GAIN_PERCENT` | `60` | Minimum 24h percentage gain |
+| `MIN_GAIN_PERCENT` | `60` | Minimum rolling 24h percentage gain (1m approximation) |
 | `MIN_TURNOVER_USDT` | `1000000` | Minimum 24h turnover |
 | `MIN_OI_TURNOVER_RATIO` | `0.10` | Minimum OI/turnover ratio (10%) |
 | `MAX_OI_TURNOVER_RATIO` | unset | Optional upper ratio, e.g. `1.50` for 150% |
 | `DB_PATH` | `data/mexc_futures.db` in repo | SQLite database location |
 
-The first scan alerts on currently qualifying contracts. Each subscriber receives
-one alert per qualifying period, including across restarts. A successfully evaluated
-contract that stops qualifying is rearmed and can alert again on re-entry. Missing
-or malformed data and failed scans do not reset alerts. Failed Telegram deliveries
+The first scan alerts on currently qualifying contracts unless already sent that UTC
+day. Each subscriber receives a ticker at most once per calendar day (00:00–24:00
+UTC), even if it drops below the criteria and qualifies again. SQLite stores the
+latest successful send time for each subscriber/ticker, so this daily cache survives
+restarts and works with existing alert records. A qualifying ticker may alert again
+after midnight UTC, even if it qualified continuously. Failed Telegram deliveries
 retry on subsequent scans while the contract qualifies. A crash after Telegram
 accepts a message but before SQLite records it can cause a duplicate on restart.
 
